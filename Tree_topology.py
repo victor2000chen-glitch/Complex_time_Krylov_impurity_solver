@@ -13,10 +13,7 @@ import pytreenet.contractions.state_operator_contraction as soc
 import pytreenet.contractions.tree_contraction as tree_contraction
 
 def force_ket_first_contraction(ket_node, operator_node):
-    """
-    Avoid the operator-first contraction branch, which currently
-    mishandles temporary BUG basis-change node identifiers.
-    """
+
     return soc.FirstContraction.KET
 
 
