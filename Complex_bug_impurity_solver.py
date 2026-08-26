@@ -1,17 +1,20 @@
 from utils import conjugate
 import numpy as np
+from numpy import linalg 
 from pytreenet.ttns.ttns_ttno.application import (
     apply_ttno_to_ttns,
     ApplicationMethod,
 )
 from scipy import sparse
+from scipy.linalg import expm
 from pytreenet.time_evolution.bug import BUG, BUGConfig
 from pytreenet.ttns import TreeTensorNetworkState
 from pytreenet.operators import TensorProduct
 import copy
 from utils import construct_spinful_fermionic_operators
-
-
+from numpy.linalg import inv
+import scipy.integrate as integrate
+from scipy.integrate import quad_vec
 #Time evolution of TTNS
 def BUG_time_evolution(Tree_state,TTNO_Hamil,time_step_size,final_time,operators,max_bond_dim=20, rel_tol = 1e-16, abs_tol = 1e-16):
     """Time evolution of TTN using the bug integrator"""
@@ -59,6 +62,48 @@ def Grams_schmidt(vectors,tolerance= 1e-10,Keep_all=False):
         X = (U[:, keep]@ np.diag(1.0 / np.sqrt(eigenvalues[keep]))) #change to U@ 1/np.sqrt(eigenvalues)
 
     return X, eigenvalues[keep]
+
+
+def pivoted_cholesky(vectors, tol=1e-8,svd_tol= 1e-10):
+    n_krylov = len(vectors)
+
+    S = np.zeros((n_krylov, n_krylov),dtype=np.complex128,)
+    for i in range(n_krylov):
+        for j in range(n_krylov):
+            S[i, j] = (vectors[i].scalar_product(vectors[j])) #compute overlap
+    n= np.shape(S)[0]
+    m=0
+    d= d = np.real(np.diag(S)).copy()
+    error= np.sum(d)
+    p= np.arange(n)
+    l= np.zeros_like(S)
+    while error>tol and m<n:
+        remaining= p[m:]
+        i = m + np.argmax(d[remaining])
+        p[m],p[i]=(p[i],p[m])
+        pivot=p[m]
+        l[m][pivot]= np.sqrt(d[pivot])
+        for idx in range(m+1,n):
+            term=0
+            for jdx in range(m):
+                term += np.conjugate(l[jdx][p[m]])*l[jdx][p[idx]]
+            l[m][p[idx]]= (S[p[m]][p[idx]]-term)/(l[m][p[m]])
+            d[p[idx]] -= np.abs(l[m][p[idx]])**2
+        error=sum([d[p[i]] for i in range(m+1,n) ]) 
+        m+=1
+    L=l[:m]
+    U_L, singular_values, Vh = np.linalg.svd(L,full_matrices=False)
+
+    keep = singular_values > svd_tol * singular_values[0]
+
+    sigma = singular_values[keep]
+
+    # V has dimensions (m, r)
+    V = Vh.conj().T[:, keep]
+
+    X = V @ np.diag(1.0 / sigma)
+
+    return L, p, d, error,X
 
 
 def krylov_projection(H,X,vectors,tol=1e-3,Keep_all=False):
@@ -221,38 +266,21 @@ def krylov_projection_TTN(H,X,vectors,tol=1e-3,Keep_all=False):
 
             K[n, p] = (H_vectors[n].scalar_product(H_vectors[p]))
 
-    # Numerical Hermitisation
-    #S = 0.5 * (S + S.conj().T)
 
-    #H_eff = 0.5 * (H_eff + H_eff.conj().T)
-
-    #K = 0.5 * (K + K.conj().T)
-
-    # ------------------------------------------------
     # Transform Hamiltonian into orthonormal
     # Krylov basis
-    # ------------------------------------------------
 
     H_eff_orthog = (X.conj().T@ H_eff@ X)
 
-    #H_eff_orthog = 0.5 * (H_eff_orthog+ H_eff_orthog.conj().T)
 
-    # ------------------------------------------------
     # Ritz eigenvalues/eigenvectors
-    # ------------------------------------------------
+
 
     energies, Q = np.linalg.eigh(H_eff_orthog)
-
-    # Coefficients in ORIGINAL TTNS basis
-    #
-    # |Phi_i> = sum_j coefficients[j,i] |psi_j>
-    #
     coefficients = X @ Q
 
-    # ------------------------------------------------
+ 
     # Residuals
-    # ------------------------------------------------
-
     residuals = np.zeros(r)
 
     for i in range(r):
@@ -270,9 +298,9 @@ def krylov_projection_TTN(H,X,vectors,tol=1e-3,Keep_all=False):
 
         residuals[i] = np.sqrt(np.abs(residual_squared))
 
-    # ------------------------------------------------
+
     # Relative residuals
-    # ------------------------------------------------
+
 
     relative_residuals = (residuals/ np.maximum(np.abs(energies),1.0))
 
@@ -404,4 +432,46 @@ def Greens_function_lehman_TTN(E,Ritz_coefficients,Krylo_vectors,eta,w,node_key=
         term_1+= (np.vdot(psi_0,C @ Ritz_coefficients[:,i])*np.vdot(Ritz_coefficients[:,i],C_dagg @ psi_0))/(w+1.0j*eta+E_0-E[i])
         term_2+= (np.vdot(psi_0,C_dagg @ Ritz_coefficients[:,i])*np.vdot(Ritz_coefficients[:,i],C @ psi_0))/(w+1.0j*eta+E[i]-E_0)
     G = term_1+term_2
+    return G
+
+
+def real_time_evolution(t,eta,w,psi_0,vectors,TTNO,operators,max_bond_dim,E_0=0.0):
+    """Real time evolution using physical Hamiltonian which evolves backwards in time"""
+    integrand=[]
+    f_t=np.exp(1.0j*t*(E_0+w+1.0j*eta))
+    tree_bug,_,_ = BUG_time_evolution(Tree_state=psi_0 ,TTNO_Hamil=TTNO,time_step_size=1.0,final_time=t,
+        operators=operators,
+        max_bond_dim=max_bond_dim,
+        rel_tol=1e-12,
+        abs_tol=1e-12)
+    psi_0_t=tree_bug.state
+    for i in range(len(vectors)):
+        integrand.append(psi_0_t.scalar_product(vectors[i])*f_t)
+    return np.asarray(integrand)
+
+def boost_operator(Vectors,psi_0,Q,X,E,eta,T,w,TTNO,operators,max_bond_dim,E_0=0.0):
+    """The Correction to the Boost operator K_AB"""
+    M= np.zeros(len(Vectors),dtype=np.complex128)
+    for i in range(len(Vectors)):
+        M[i]= Vectors[i].scalar_product(Vectors[0])
+    
+    #E_eff= np.diag(E)
+    #dim=np.shape(E_eff)[0]
+    #term= -1.0j *(E_eff- (E_0+1.0j*eta+w)*np.eye(dim))*T
+    #Matrix_exponential= expm(term)
+    #inverse_product= inv((np.eye(dim)-Matrix_exponential))
+    u = np.exp(-1.0j* (E - E_0 - w - 1.0j * eta)* T)
+    K_diag = u / (1.0 - u)
+    right = (Q.conj().T@ X.conj().T@ M)
+    right *= K_diag
+    A = X @ Q @ right
+    #A= X @ Q@ Matrix_exponential @inverse_product@ conjugate(Q) @ conjugate(X)@ M
+    f_t,_=integrate.quad_vec(lambda t: real_time_evolution(t,eta,w,psi_0,Vectors,TTNO,operators,max_bond_dim,E_0), 0, T)
+    return np.dot(f_t,A)
+
+def Greens_function_CTKS(psi_A,psi_B,Vectors,Q,X,E,eta,T,w,TTNO,operators,max_bond_dim,E_0=0.0):
+    """Returns the Greens function in frequency space using CTKS method"""
+    list_vec=[psi_B]
+    G_tilde,_=integrate.quad_vec(lambda t: real_time_evolution(t,eta,w,psi_A,list_vec,TTNO,operators,max_bond_dim,E_0), 0, T)
+    G= G_tilde+boost_operator(Vectors,psi_A,Q,X,E,eta,T,w,TTNO,operators,max_bond_dim,E_0=E_0)
     return G
